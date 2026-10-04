@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Editor de Imágenes Automático</title>
+    <style>
+        body { font-family: system-ui; max-width: 800px; margin: 2rem auto; text-align: center; }
+        input { width: 80%; padding: 10px; margin-bottom: 10px; }
+        button { padding: 10px 20px; cursor: pointer; background: #007bff; color: white; border: none; }
+        img { max-width: 100%; margin-top: 20px; border-radius: 8px; }
+    </style>
+</head>
+<body>
+    <h1>Eliminador de Marcas de Agua</h1>
+    <input type="text" id="urlInput" placeholder="Pega el enlace de la página de Getty Images aquí...">
+    <button onclick="procesarImagen()">Procesar Imagen</button>
+    
+    <div id="loading" style="display: none;">Procesando capas en el servidor...</div>
+    <div id="resultado"></div>
+
+    <script>
+        async function procesarImagen() {
+            const url = document.getElementById('urlInput').value;
+            const loading = document.getElementById('loading');
+            const resultado = document.getElementById('resultado');
+            
+            if (!url) return alert('Ingresa una URL');
+            
+            loading.style.display = 'block';
+            resultado.innerHTML = '';
+
+            try {
+                const response = await fetch('/api/procesar', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+
+                if (!response.ok) throw new Error('Fallo en el servidor');
+
+                // Recibimos el buffer binario y lo convertimos a un Object URL local
+                const blob = await response.blob();
+                const imageUrl = URL.createObjectURL(blob);
+                
+                resultado.innerHTML = `
+                    <img src="${imageUrl}" alt="Resultado">
+                    <br><br>
+                    <a href="${imageUrl}" download="resultado.jpg">
+                        <button style="background: #28a745;">Descargar Imagen</button>
+                    </a>
+                `;
+            } catch (error) {
+                alert('Ocurrió un error al procesar la imagen.');
+            } finally {
+                loading.style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>
