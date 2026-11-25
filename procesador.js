@@ -1,113 +1,187 @@
 const axios = require('axios');
 const sharp = require('sharp');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 
-puppeteer.use(StealthPlugin());
+const DOMINIOS_GETTY = new Set([
+    'gettyimages.com', 'gettyimages.es', 'gettyimages.co.uk',
+    'gettyimages.ca', 'gettyimages.com.au', 'gettyimages.fr',
+    'gettyimages.de', 'gettyimages.it', 'gettyimages.pt',
+    'gettyimages.com.mx', 'gettyimages.com.br'
+]);
+const CDN_GETTY = 'media.gettyimages.com';
+const REDIRECCIONES = new Set([301, 302, 303, 307, 308]);
 
-async function descargarImagen(url) {
-    const respuesta = await axios({ 
-        url, 
-        responseType: 'arraybuffer',
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-    });
-    return Buffer.from(respuesta.data, 'binary');
-}
-
-async function extraerUrls(urlPagina) {
-    let browser;
-    try {
-        console.log("-> Levantando navegador invisible para evadir CloudFront...");
-        browser = await puppeteer.launch({
-            headless: "new",
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Lee la ruta del Dockerfile
-            args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage', // Previene bloqueos de memoria en contenedores
-                '--disable-gpu'
-            ]
-        });
-        
-        const page = await browser.newPage();
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-                req.abort();
-            } else {
-                req.continue();
-            }
-        });
-        
-        await page.goto(urlPagina, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        
-        const html = await page.content();
-        
-        console.log("-> Buscando patrones de resolución en el código...");
-        const regexAlta = /https:\/\/[^"']*\?s=2048x2048[^"']*/g;
-        const regexBaja = /https:\/\/[^"']*\?s=594x594[^"']*/g;
-
-        const matchAlta = html.match(regexAlta);
-        const matchBaja = html.match(regexBaja);
-
-        if (!matchAlta || !matchBaja) {
-            throw new Error("CloudFront superado, pero no se encontraron las URLs en el HTML. Revisa el enlace.");
-        }
-
-        const urlAlta = matchAlta[0].replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
-        const urlBaja = matchBaja[0].replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
-
-        console.log("-> URL 2048px obtenida y limpiada exitosamente.");
-        return { urlAlta, urlBaja };
-
-    } finally {
-        if (browser) await browser.close();
+class ErrorProcesamiento extends Error {
+    constructor(status, mensaje, opciones) {
+        super(mensaje, opciones);
+        this.status = status;
     }
 }
 
-async function procesarDesdeEnlaceWeb(urlPagina) {
-    const { urlAlta, urlBaja } = await extraerUrls(urlPagina);
-    
-    const bufferAlta = await descargarImagen(urlAlta);
-    const bufferBaja = await descargarImagen(urlBaja);
-
-    const metadatosAlta = await sharp(bufferAlta).metadata();
-    const { width: ancho, height: alto } = metadatosAlta;
-    const esHorizontal = ancho > alto;
-
-    const idAncho = Math.round(ancho * 0.25);
-    const idAlto = Math.round(alto * 0.06);
-    const idX = 0;
-    const idY = alto - idAlto;
-    
-    const marcaAncho = Math.round(ancho * (esHorizontal ? 0.60 : 0.95)); 
-    const marcaAlto = Math.round(alto * (esHorizontal ? 0.35 : 0.22));   
-    
-    const marcaX = ancho - marcaAncho;
-    
-    const marcaY = Math.round(alto * (esHorizontal ? 0.45 : 0.58));
-
-    const mascaraSvg = `
-        <svg width="${ancho}" height="${alto}">
-            <rect x="${idX}" y="${idY}" width="${idAncho}" height="${idAlto}" fill="black" />
-            <rect x="${marcaX}" y="${marcaY}" width="${marcaAncho}" height="${marcaAlto}" fill="black" />
-        </svg>
-    `;
-
-    const capaSuperiorRecortada = await sharp(bufferAlta)
-        .composite([{ input: Buffer.from(mascaraSvg), blend: 'dest-out' }])
-        .png()
-        .toBuffer();
-
-    const capaInferiorEscalada = await sharp(bufferBaja)
-        .resize(ancho, alto)
-        .toBuffer();
-
-    // Retorna directamente el buffer en formato JPEG
-    return await sharp(capaInferiorEscalada)
-        .composite([{ input: capaSuperiorRecortada, blend: 'over' }])
-        .jpeg({ quality: 95 })
-        .toBuffer();
+function esUrlHttps(url) {
+    return url.protocol === 'https:' && !url.username && !url.password && !url.port;
 }
 
-module.exports = { procesarDesdeEnlaceWeb };
+function esPaginaGetty(url) {
+    return esUrlHttps(url) && DOMINIOS_GETTY.has(url.hostname.replace(/^www\./, ''));
+}
+
+function esImagenGetty(url) {
+    return esUrlHttps(url) && url.hostname === CDN_GETTY;
+}
+
+async function obtenerRecurso(url, { validar, accept, tipoRespuesta, limite }) {
+    for (let redirecciones = 0; redirecciones <= 3; redirecciones++) {
+        let respuesta;
+        try {
+            respuesta = await axios.get(url.href, {
+                headers: { Accept: accept },
+                responseType: tipoRespuesta,
+                timeout: 12000,
+                maxContentLength: limite,
+                maxRedirects: 0,
+                validateStatus: () => true
+            });
+        } catch (error) {
+            if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+                throw new ErrorProcesamiento(504, 'Getty tardó demasiado en responder.', { cause: error });
+            }
+            throw new ErrorProcesamiento(502, 'No se pudo conectar con Getty.', { cause: error });
+        }
+
+        if (REDIRECCIONES.has(respuesta.status) && respuesta.headers.location) {
+            let destino;
+            try {
+                destino = new URL(respuesta.headers.location, url);
+            } catch {
+                throw new ErrorProcesamiento(502, 'Getty devolvió una redirección inválida.');
+            }
+            if (!validar(destino)) {
+                throw new ErrorProcesamiento(502, 'Getty redirigió la solicitud fuera del dominio esperado.');
+            }
+            url = destino;
+            continue;
+        }
+        if (respuesta.status === 401 || respuesta.status === 403 || respuesta.status === 429) {
+            throw new ErrorProcesamiento(502, 'Getty rechazó la solicitud (HTTP ' + respuesta.status + ').');
+        }
+        if (respuesta.status !== 200) {
+            throw new ErrorProcesamiento(502, 'Getty devolvió HTTP ' + respuesta.status + '.');
+        }
+        return respuesta;
+    }
+    throw new ErrorProcesamiento(502, 'Getty devolvió demasiadas redirecciones.');
+}
+
+function extraerUrls(html, id) {
+    const contenido = html.replace(/\\\//g, '/')
+        .replace(/\\u0026|&amp;|&#38;|&#x26;/gi, '&');
+    const urls = new Map();
+    const candidatos = contenido.matchAll(/https:\/\/media\.gettyimages\.com\/id\/[^\s"'<>\\]+/gi);
+    for (const [candidato] of candidatos) {
+        const url = new URL(candidato);
+        if (url.pathname.split('/')[2] !== id) continue;
+        const tamano = url.searchParams.get('s');
+        if (!urls.has(tamano)) urls.set(tamano, url);
+    }
+    const alta = urls.get('2048x2048');
+    const baja = urls.get('594x594');
+    if (!alta || !baja) {
+        const faltantes = [!alta && '2048 px', !baja && '594 px'].filter(Boolean).join(' y ');
+        throw new ErrorProcesamiento(422, 'La respuesta de Getty no incluye la variante de ' + faltantes + ' para esta imagen.');
+    }
+    return [alta, baja];
+}
+
+async function descargarImagen(url) {
+    const { data, headers } = await obtenerRecurso(url, {
+        validar: esImagenGetty,
+        accept: 'image/*',
+        tipoRespuesta: 'arraybuffer',
+        limite: 16 * 1024 * 1024
+    });
+    if (!headers['content-type']?.startsWith('image/')) {
+        throw new ErrorProcesamiento(502, 'Getty devolvió un archivo que no es una imagen.');
+    }
+    return Buffer.from(data);
+}
+
+async function prepararParche(capa, region, ancho, alto, transicion) {
+    const left = Math.max(0, region.x - transicion);
+    const top = Math.max(0, region.y - transicion);
+    const width = Math.min(ancho, region.x + region.ancho + transicion) - left;
+    const height = Math.min(alto, region.y + region.alto + transicion) - top;
+    const mascara = Buffer.alloc(width * height * 4, 255);
+
+    for (let y = 0; y < height; y++) {
+        const dy = Math.max(region.y - top - y, top + y - (region.y + region.alto - 1), 0);
+        for (let x = 0; x < width; x++) {
+            const dx = Math.max(region.x - left - x, left + x - (region.x + region.ancho - 1), 0);
+            const t = Math.min(1, Math.hypot(dx, dy) / transicion);
+            const opacidad = 1 - t * t * (3 - 2 * t);
+            mascara[(y * width + x) * 4 + 3] = Math.round(opacidad * 255);
+        }
+    }
+    const recorte = await sharp(capa).extract({ left, top, width, height }).png().toBuffer();
+    const input = await sharp(recorte)
+        .ensureAlpha()
+        .composite([{ input: mascara, raw: { width, height, channels: 4 }, blend: 'dest-in' }])
+        .png()
+        .toBuffer();
+    return { input, left, top };
+}
+
+async function componerImagen(bufferAlta, bufferBaja) {
+    const alta = sharp(bufferAlta);
+    const { width: ancho, height: alto } = await alta.metadata();
+    const horizontal = ancho > alto;
+    const idAlto = Math.max(1, Math.round(alto * 0.06));
+    const marcaAncho = Math.max(1, Math.round(ancho * (horizontal ? 0.60 : 0.95)));
+    const regiones = [
+        { x: 0, y: alto - idAlto, ancho: Math.max(1, Math.round(ancho * 0.25)), alto: idAlto },
+        {
+            x: ancho - marcaAncho,
+            y: Math.round(alto * (horizontal ? 0.45 : 0.58)),
+            ancho: marcaAncho,
+            alto: Math.max(1, Math.round(alto * (horizontal ? 0.35 : 0.22)))
+        }
+    ];
+
+    const capaEscalada = await sharp(bufferBaja)
+        .resize(ancho, alto)
+        .sharpen({ sigma: 1.1, m1: 0.2, m2: 1.4 })
+        .png()
+        .toBuffer();
+    const transicion = Math.max(2, Math.round(Math.min(ancho, alto) * (horizontal ? 0.018 : 0.013)));
+    const parches = await Promise.all(regiones.map(region =>
+        prepararParche(capaEscalada, region, ancho, alto, transicion)
+    ));
+
+    return alta.composite(parches).jpeg({ quality: 95, chromaSubsampling: '4:4:4' }).toBuffer();
+}
+
+async function procesarDesdeEnlaceWeb(enlace) {
+    let url;
+    try {
+        if (typeof enlace === 'string') url = new URL(enlace.trim());
+    } catch {
+        throw new ErrorProcesamiento(400, 'Pega el enlace completo a la página de una imagen de Getty.');
+    }
+    const id = url?.pathname.match(/\/(\d+)\/?$/)?.[1];
+    if (!url || !esPaginaGetty(url) || !url.pathname.startsWith('/detail/') || !id) {
+        throw new ErrorProcesamiento(400, 'Pega el enlace completo a la página de una imagen de Getty.');
+    }
+    const { data: html, headers } = await obtenerRecurso(url, {
+        validar: esPaginaGetty,
+        accept: 'text/html',
+        tipoRespuesta: 'text',
+        limite: 8 * 1024 * 1024
+    });
+    if (!headers['content-type']?.startsWith('text/html')) {
+        throw new ErrorProcesamiento(502, 'Getty devolvió una respuesta distinta a la página de la imagen.');
+    }
+    const urls = extraerUrls(html, id);
+    const [alta, baja] = await Promise.all(urls.map(descargarImagen));
+    return componerImagen(alta, baja);
+}
+
+module.exports = { ErrorProcesamiento, procesarDesdeEnlaceWeb };

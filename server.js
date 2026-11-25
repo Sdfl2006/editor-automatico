@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const basicAuth = require('express-basic-auth');
-const { procesarDesdeEnlaceWeb } = require('./procesador');
+const { ErrorProcesamiento, procesarDesdeEnlaceWeb } = require('./procesador');
 
 const app = express();
 app.use(cors());
@@ -24,14 +24,13 @@ app.use(basicAuth({
 app.use(express.static('public'));
 
 app.post('/api/procesar', async (req, res) => {
-    const { url } = req.body;
+    const { url } = req.body ?? {};
     
     if (!url) {
         return res.status(400).json({ error: 'URL requerida' });
     }
 
     try {
-        console.log(`Procesando solicitud para: ${url}`);
         const imagenBuffer = await procesarDesdeEnlaceWeb(url);
         
         res.set('Content-Type', 'image/jpeg');
@@ -39,8 +38,12 @@ app.post('/api/procesar', async (req, res) => {
         res.send(imagenBuffer);
         
     } catch (error) {
-        console.error("Error en el pipeline:", error);
-        res.status(500).json({ error: 'Fallo al procesar la imagen' });
+        if (error instanceof ErrorProcesamiento) {
+            console.warn('Error en el pipeline:', error.status, error.message);
+            return res.status(error.status).json({ error: error.message });
+        }
+        console.error('Error en el pipeline:', error.message);
+        return res.status(500).json({ error: 'No se pudo aplicar la edición a la imagen.' });
     }
 });
 
