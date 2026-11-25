@@ -37,7 +37,10 @@
                     body: JSON.stringify({ url })
                 });
 
-                if (!response.ok) throw new Error('Fallo en el servidor');
+                if (!response.ok) {
+                    const data = await response.json().catch(() => null);
+                    throw new Error(data?.error || `El servidor devolvió HTTP ${response.status}.`);
+                }
 
                 // Recibimos el buffer binario y lo convertimos a un Object URL local
                 const blob = await response.blob();
@@ -51,7 +54,9 @@
                     </a>
                 `;
             } catch (error) {
-                alert('Ocurrió un error al procesar la imagen.');
+                resultado.textContent = error instanceof TypeError
+                    ? 'No se pudo conectar con el servidor.'
+                    : error.message;
             } finally {
                 loading.style.display = 'none';
             }
